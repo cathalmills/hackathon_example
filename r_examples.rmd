@@ -621,7 +621,7 @@ colnames(dt_final)
 
 
 
-# GAM Fitting
+# Toy GAM Fitting
 
 ```{r}
 # GAM for 20 regions independently
@@ -816,11 +816,6 @@ g <- ggplot(plot_wide[region %in% plot_regions], aes(x = target_end_date)) +
 print(g)
 ```
 
-
-
-```{r, fig.show="asis"}
-agg_plot_for_printing
-```
 
 ```{r, fig.show="asis"}
 ## ---------------------------
@@ -1141,7 +1136,10 @@ res <- list(forecasts = fcst_dt, scores_raw = scores_raw, eval_summary = eval_fu
 message("Done. res contains forecasts, raw scores, eval summary and window summary.")
 ```
 
-
+```{r}
+setkeyv(scoring_input, c("location", "model", "target_end_date", "horizon"))
+write.csv(scoring_input, "scoring_input_template.csv")
+```
 
 ```{r}
 # More evaluation for the above: Can be adapted very easily
@@ -1265,4 +1263,12 @@ eval_results <- list(
     win_summary = win_summary,
     pairwise = pairwise
 )
+```
+
+
+```{r}
+# For next steps:
+## Toy example of a GAM -> just one way of forecasting with future covariates
+## For improving, recommend proper feature exploration, see Python notebook
+## Also recommend BAM, INLA and/or brms for efficiency
 ```
