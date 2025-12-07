@@ -1,0 +1,1268 @@
+---
+title: "Untitled"
+author: ""
+date: ""
+output: 
+  pdf_document:
+    fig_height: 3
+    fig_width: 5
+  html_document:
+    fig_height: 3
+    fig_width: 5
+  word_document:
+    fig_height: 3
+    fig_width: 5
+---
+
+```{r, setup, include=FALSE}
+require(mosaic) # Load additional packages here
+require(ncdf4)
+require(terra)
+require(data.table)
+require(lubridate)
+require(ggplot2)
+require(ggpubr)
+require(zoo)
+require(patchwork)
+require(viridis)
+require(scoringutils)
+require(mgcv)
+library(data.table)
+library(forecast) # The classic ARIMA package
+library(lubridate)
+library(scoringutils)
+library(ggplot2)
+library(tidyr) # For pivot_wider
+require(INLA)
+knitr::opts_chunk$set(
+    tidy = FALSE, # display code as typed
+    size = "small"
+) # slightly smaller font for code
+```
+
+
+# DATA PROCESSING
+
+```{r}
+get_eom <- function(x) {
+    # If x is string "YYYY-MM", paste "-01" to make it a date first
+    if (is.character(x)) x <- as.Date(paste0(x, "-01"))
+    # Move to next month's 1st day, then subtract 1 day
+    ceiling_date(x, "month") - days(1)
+}
+# --- 1. Load and Prepare CSV Files ---
+
+# Load Epidemiological Training Data
+#
+dt_epi <- data.table(read.csv("BRA_epi_training.csv"))
+# Convert 'Month' (e.g., "2015-01") to a proper Date object (1st of the month)
+dt_epi[, Date := get_eom(Month)]
+dt_epi[, Month := NULL] # Remove original string column if desired
+head(dt_epi)
+```
+
+# Plotting Data
+
+```{r}  
+# --- 1. Robust NetCDF Processing Function ---
+# --- 1. Robust NetCDF Processing Function (Handles Static & Time-Varying) ---
+process_nc <- function(file_path, var_prefix = "") {
+    nc <- nc_open(file_path)
+    on.exit(nc_close(nc))
+
+    # Identify Dimensions
+    dnames <- names(nc$dim)
+    t_dim <- if ("time" %in% dnames) "time" else "month"
+    r_dim <- if ("region" %in% dnames) "region" else "mun"
+
+    # Extract Time
+    t_vals <- ncvar_get(nc, t_dim)
+    t_units <- ncatt_get(nc, t_dim, "units")$value
+
+    # Time Parsing Logic
+    if (is.null(t_units)) {
+        dates <- as.Date(paste0("2000-", t_vals, "-01"))
+    } else {
+        t_units_clean <- tolower(trimws(t_units))
+        if (grepl("since", t_units_clean)) {
+            parts <- strsplit(t_units_clean, " since ")[[1]]
+            origin_str <- parts[2]
+            if (grepl("second", parts[1])) {
+                dates <- as.Date(as.POSIXct(t_vals, origin = origin_str, tz = "UTC"))
+            } else {
+                dates <- as.Date(t_vals, origin = origin_str)
+            }
+        } else {
+            dates <- as.Date(t_vals, origin = "1970-01-01")
+        }
+    }
+
+    # Align to End of Month
+    get_eom <- function(x) {
+        if (is.character(x)) x <- as.Date(paste0(x, "-01"))
+        ceiling_date(x, "month") - days(1)
+    }
+    dates <- get_eom(dates)
+
+    # Extract Regions
+    regions <- ncvar_get(nc, r_dim)
+
+    # Create Grid: CJ(Date, Region, sorted=FALSE)
+    # This creates order: Date1-Reg1, Date1-Reg2 ... Date2-Reg1...
+    dt_out <- CJ(Date = dates, Region = regions, sorted = FALSE)
+
+    n_dates <- length(dates)
+    n_regions <- length(regions)
+
+    # Extract Variables
+    for (v in names(nc$var)) {
+        if (!v %in% dnames) {
+            val <- ncvar_get(nc, v)
+            val_dims <- dim(val)
+
+            # Case 1: Time-Varying Variable (Region x Time) or (Time x Region)
+            if (!is.null(val_dims) && length(val_dims) == 2) {
+                # Check if Transpose is needed
+                # We need [Region, Time] because CJ(Date, Region) varies Region fastest?
+                # WAIT: CJ(Date, Region) -> Date stays, Region cycles.
+                # So we want: Date1(Reg1, Reg2, ...), Date2(Reg1, Reg2...)
+                # This matches [Region, Time] flattened by as.vector (Time varies slowest).
+
+                var_dim_names <- sapply(nc$var[[v]]$dim, function(x) x$name)
+
+                # If Time is the first dimension in the array, transpose it so Region is first
+                if (var_dim_names[1] == t_dim) {
+                    val <- t(val)
+                }
+
+                dt_out[, (paste0(var_prefix, v)) := as.vector(val)]
+            } else if (is.null(val_dims) || length(val_dims) == 1) {
+                # Case 2: Static Variable (Region only) - e.g. 'area'
+                # Dimension is usually Region.
+                # We need to recycle this vector for every Date.
+
+                if (length(val) == n_regions) {
+                    # Replicate the region vector 'n_dates' times
+                    dt_out[, (paste0(var_prefix, v)) := rep(as.vector(val), times = n_dates)]
+                } else if (length(val) == n_dates) {
+                    # Replicate the time vector 'n_regions' times (each element repeated)
+                    dt_out[, (paste0(var_prefix, v)) := rep(as.vector(val), each = n_regions)]
+                } else {
+                    warning(paste("Variable", v, "has length", length(val), "which matches neither Region nor Time count. Skipping."))
+                }
+            }
+        }
+    }
+    return(dt_out)
+}
+# --- 4. Function Specifically for Seasonal Forecasts (3D) ---
+#
+process_seasonal_pivot <- function(file_path, var_prefix = "seas_") {
+    nc <- nc_open(file_path)
+    on.exit(nc_close(nc))
+
+    # Extract Dimensions: [Region, Lead, Origin_Time]
+    regions <- ncvar_get(nc, "region")
+    leads <- ncvar_get(nc, "month") # 0, 1, 2, 3, 4, 5
+    origin_time <- ncvar_get(nc, "time")
+
+    # Parse Origin Dates
+    t_unit <- ncatt_get(nc, "time", "units")$value
+    origin_dates <- as.Date(as.POSIXct(origin_time, origin = sub(".*since ", "", t_unit), tz = "UTC"))
+
+    # Create Grid matching array order [Region, Lead, Time]
+    # CJ varies last argument fastest -> Order: Time, Lead, Region
+    dt_long <- CJ(
+        Origin_Date = origin_dates,
+        Lead = leads,
+        Region = regions,
+        sorted = FALSE
+    )
+
+    # Extract Variables
+    vars_to_read <- names(nc$var)[!names(nc$var) %in% c("region", "month", "time", "times")]
+
+    for (v in vars_to_read) {
+        data_array <- ncvar_get(nc, v)
+        # Ensure it's 3D before assigning
+        if (length(dim(data_array)) == 3) {
+            dt_long[, (v) := as.vector(data_array)]
+        }
+    }
+
+    # Calculate Target Date (End of Month)
+    dt_long[, target_end_date := get_eom(Origin_Date %m+% months(Lead))]
+
+    # Remove Origin_Date now that we have target_end_date and Lead
+    dt_long[, Origin_Date := NULL]
+
+    # --- PIVOT TO WIDE FORMAT ---
+    # We want one row per (Region, target_end_date) with columns for each Lead
+    formula_cast <- paste("Region + target_end_date ~ Lead")
+
+    # Reshape for each variable found (t2m, rh, tp, etc.)
+    dt_wide <- dt_long[, dcast(.SD, Region + target_end_date ~ Lead, value.var = vars_to_read)]
+
+    # Rename columns to be descriptive (e.g., seas_t2m_L0, seas_t2m_L1)
+    # The dcast will likely produce names like "t2m_0", "t2m_1"
+    setnames(dt_wide, old = names(dt_wide), new = gsub("_(\\d+)$", "_L\\1", names(dt_wide)))
+
+    # Add prefix to variables if requested
+    if (var_prefix != "") {
+        cols <- setdiff(names(dt_wide), c("Region", "target_end_date"))
+        setnames(dt_wide, cols, paste0(var_prefix, cols))
+    }
+
+    # Rename target_end_date to Date for merging
+    setnames(dt_wide, "target_end_date", "Date")
+
+    return(dt_wide)
+}
+
+# --- 5. Process and Merge ---
+
+# Standard Features
+dt_pop <- process_nc("BRA-population.zs.nc", var_prefix = "")
+setnames(dt_pop, c("pop_pop_count", "pop_pop_density"), c("pop_count", "pop_density"))
+tail(dt_pop)
+dt_gdp <- process_nc("BRA-gdp_pc.zs.nc", var_prefix = "gdp_")
+dt_climate <- process_nc("BRA-reanalysis_monthly.zs.nc", var_prefix = "reanalysis_")
+dt_spe <- process_nc("BRA-spe06.zs.nc", var_prefix = "")
+tail(dt_climate)
+
+# Seasonal Forecast (Pivoted)
+dt_seas_wide <- process_seasonal_pivot("BRA-seasonal_forecast_monthly.zs.nc", var_prefix = "seas_")
+
+# Merge
+dt_final <- dt_epi
+# Ensure types match for merging
+dt_final[, Region := as.integer(Region)]
+
+# List of tables to merge
+tables_to_merge <- list(dt_pop, dt_gdp, dt_climate, dt_spe, dt_seas_wide)
+
+for (tbl in tables_to_merge) {
+    if (!is.null(tbl)) {
+        if ("Region" %in% names(tbl)) tbl[, Region := as.integer(Region)]
+        dt_final <- merge(dt_final, tbl, by = c("Region", "Date"), all.x = TRUE)
+    }
+}
+
+head(dt_climate)
+# Order and View
+setorder(dt_final, Region, Date)
+print(dim(dt_final))
+
+
+dt_final[, pop_count := zoo::na.approx(pop_count, maxgap = Inf, na.rm = FALSE), by = Region]
+dt_final[, pop_count := zoo::na.locf(pop_count, na.rm = FALSE), by = Region]
+dt_final[, pop_count := zoo::na.locf(pop_count, fromLast = TRUE, na.rm = FALSE), by = Region]
+
+dt_final[, pop_density := zoo::na.approx(pop_density, maxgap = Inf, na.rm = FALSE), by = Region]
+dt_final[, pop_density := zoo::na.locf(pop_density, na.rm = FALSE), by = Region]
+dt_final[, pop_density := zoo::na.locf(pop_density, fromLast = TRUE, na.rm = FALSE), by = Region]
+```
+
+```{r}
+colnames(dt_plot)
+dt_plot <- copy(dt_final)
+# Metrics
+dt_plot[, log_cases := log1p(Cases)]
+dt_plot[, incidence := (Cases / pop_count) * 100000]
+
+
+# --- 4. Sorting and Capping for Plots ---
+head(dt_plot)
+# Sort Regions by Total Cases (High to Low)
+region_order <- dt_plot[, .(Total = sum(Cases, na.rm = TRUE)), by = Region][order(-Total)]$Region
+dt_plot[, Region := factor(Region, levels = region_order)]
+
+# Cap Incidence and Precipitation at 99th percentile (for better visualization)
+# inc_cap <- quantile(dt_plot$incidence, 0.99, na.rm = TRUE)
+# tp_cap <- quantile(dt_plot$reanalysis_tp, 0.99, na.rm = TRUE)
+
+# dt_plot[, incidence_capped := pmin(incidence, inc_cap)]
+# dt_plot[, tp_capped := pmin(reanalysis_tp, tp_cap)]
+
+# --- 5. Plotting (Replicating Tile Plots) ---
+
+# Common theme
+common_theme <- theme_minimal() +
+    theme(
+        axis.text.y = element_blank(), # Hide region names (too many)
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank(),
+        legend.position = "right"
+    )
+
+# Plot 1: Log Cases (Viridis)
+p1 <- ggplot(dt_plot, aes(x = Date, y = Region, fill = log_cases)) +
+    geom_tile() +
+    scale_fill_viridis_c(name = "Log(Cases+1)", option = "viridis") +
+    scale_x_date(expand = c(0, 0), date_labels = "%Y") +
+    labs(title = "Log(Cases + 1)", x = NULL, y = "Regions (Sorted by Cases)") +
+    common_theme
+
+# Plot 2: Incidence (Plasma)
+p2 <- ggplot(dt_plot, aes(x = Date, y = Region, fill = incidence)) +
+    geom_tile() +
+    scale_fill_viridis_c(name = "Incidence\n(per 100k)", option = "plasma") +
+    scale_x_date(expand = c(0, 0), date_labels = "%Y") +
+    labs(title = "Dengue Incidence (Capped 99%)", x = NULL, y = NULL) +
+    common_theme
+
+# Plot 3: Temperature (Magma)
+p3 <- ggplot(dt_plot, aes(x = Date, y = Region, fill = reanalysis_t2m)) +
+    geom_tile() +
+    scale_fill_viridis_c(name = "Temp (K)", option = "magma") +
+    scale_x_date(expand = c(0, 0), date_labels = "%Y") +
+    labs(title = "Temperature (t2m)", x = "Time", y = "Regions (Sorted by Cases)") +
+    common_theme
+
+# Plot 4: Precipitation (Blues - using distllier for similar effect)
+p4 <- ggplot(dt_plot, aes(x = Date, y = Region, fill = reanalysis_tp)) +
+    geom_tile() +
+    scale_fill_distiller(name = "Precip (m)", palette = "Blues", direction = 1) +
+    scale_x_date(expand = c(0, 0), date_labels = "%Y") +
+    labs(title = "Precipitation (Capped 99%)", x = "Time", y = NULL) +
+    common_theme
+
+combined_plot <- ggarrange(p1, p2, p3, p4, nrow = 2, ncol = 2)
+colnames(dt_plot)
+print(combined_plot)
+```
+
+
+
+```{r}
+# A simple GAM for one region, one time point, and three horizons
+library(data.table)
+library(mgcv)
+library(lubridate)
+
+# ==============================================================================
+# 1. SETUP & DATA PREP
+# ==============================================================================
+# We pick the first available region to test the single-region hypothesis
+test_region <- unique(dt_plot$Region)[100]
+
+# Define the single cutoff date for this test
+cutoff_date <- as.Date("2021-12-31")
+
+# Subset the specific region from your existing dt_plot
+dt_model <- dt_plot[Region == test_region][order(Date)]
+
+# Create 'Direct' targets for 1, 3, and 6 month horizons.
+# We shift the TARGET backwards so that Row T contains predictors at T and Outcome at T+h
+dt_model[, `:=`(
+    target_1m = shift(log_cases, n = 1, type = "lead"),
+    target_3m = shift(log_cases, n = 3, type = "lead"),
+    target_6m = shift(log_cases, n = 6, type = "lead"),
+    month_num = month(Date)
+)]
+
+# Create Training Set: Data existing up to the cutoff
+dt_train <- dt_model[Date <= cutoff_date]
+
+# ==============================================================================
+# 2. FIT DIRECT MODELS (One per Horizon)
+# ==============================================================================
+# We use REANALYSIS vars (observed at time T) to predict log_cases at T+h.
+# This assumes the weather at time T impacts the disease future trajectory.
+
+# --- Horizon 1 Month ---
+# We filter !is.na(target) to ensure we have valid training labels
+m1 <- gam(
+    target_1m ~
+        s(log_cases, k = 6) + # Autoregression
+        s(reanalysis_t2m, k = 6) + # Temp
+        s(reanalysis_rh, k = 6) + # Humidity
+        s(reanalysis_tp, k = 6) + # Precip
+        s(month_num, bs = "cc", k = 12), # Seasonality
+    data = dt_train[!is.na(target_1m)],
+    method = "REML", family = gaussian()
+)
+
+# --- Horizon 3 Months ---
+m3 <- gam(
+    target_3m ~
+        s(log_cases, k = 6) +
+        s(reanalysis_t2m, k = 6) +
+        s(reanalysis_rh, k = 6) +
+        s(reanalysis_tp, k = 6) +
+        s(month_num, bs = "cc", k = 12),
+    data = dt_train[!is.na(target_3m)],
+    method = "REML", family = gaussian()
+)
+
+# --- Horizon 6 Months ---
+# We reduce k=5 here as 6-month relationships are often noisier/smoother
+m6 <- gam(
+    target_6m ~
+        s(log_cases, k = 5) +
+        s(reanalysis_t2m, k = 5) +
+        s(reanalysis_rh, k = 5) +
+        s(reanalysis_tp, k = 5) +
+        s(month_num, bs = "cc", k = 12),
+    data = dt_train[!is.na(target_6m)],
+    method = "REML", family = gaussian()
+)
+
+# ==============================================================================
+# 3. PREDICT AT THE CUTOFF
+# ==============================================================================
+# We take the data ROW exactly at the cutoff date.
+# Because we trained on 'lead' targets, applying the model to this row
+# generates the forecast for T+1, T+3, T+6 automatically.
+
+new_data <- dt_model[Date == cutoff_date]
+dt_model
+# Generate predictions
+preds <- data.table(
+    Region = test_region,
+    Forecast_Origin = cutoff_date,
+
+    # Forecast 1 Month Ahead
+    Date_1m = cutoff_date %m+% months(1),
+    Pred_1m = predict(m1, newdata = new_data, type = "response"),
+
+    # Forecast 3 Months Ahead
+    Date_3m = cutoff_date %m+% months(3),
+    Pred_3m = predict(m3, newdata = new_data, type = "response"),
+
+    # Forecast 6 Months Ahead
+    Date_6m = cutoff_date %m+% months(6),
+    Pred_6m = predict(m6, newdata = new_data, type = "response")
+)
+Pred_6m
+
+print(preds)
+```
+
+# Forecast evaluation functions
+```{r}
+# IN ADDITION TO ALL SCORINGUTILS functionality!
+pointwise_metrics_quantile_predictions <- function(models_dt) {
+    models_dt <- data.table(models_dt) # Ensure it's a data.table
+    results_dt <- models_dt[which(quantile_level == 0.5),
+        list(
+            r2 = caret::R2(predicted, observed),
+            rmse = caret::RMSE(predicted, observed),
+            mae = caret::MAE(predicted, observed)
+        ),
+        by = c("model", "target_type")
+    ]
+    return(results_dt)
+}
+```
+
+
+# SARIMA
+```{r}
+# ==============================================================================
+# 1. SETUP
+# ==============================================================================
+# Select same 10 regions
+
+my_regions <- unique(dt_plot$Region)[120:130]
+forecast_dates <- unique(dt_plot[which(year(Date) %in% c("2021", "2022"))]$Date)
+
+
+# Container for results
+arima_preds <- list()
+
+cat("Starting Rolling AutoARIMA... \n")
+
+# ==============================================================================
+# 2. ROLLING LOOP
+# ==============================================================================
+for (reg in my_regions) {
+    # Get full history for this region
+    dt_reg <- dt_plot[Region == reg][order(Date)]
+
+    for (cutoff in as.character(forecast_dates)) {
+        cutoff_date <- as.Date(cutoff)
+
+        # TRAIN: All data UP TO the cutoff
+        train_data <- dt_reg[Date <= cutoff_date]
+
+        # Need sufficient history (at least 2 seasons = 24 months recommended for ARIMA)
+        if (nrow(train_data) < 24) next
+
+        # FIT AUTO.ARIMA
+        # We construct a time series object (ts). Frequency=12 is critical for seasonality.
+        # Start date doesn't strictly matter for the fit logic, only frequency.
+        ts_train <- ts(train_data$log_cases, frequency = 12)
+
+        # Fit model (approximation=FALSE searches harder, stepwise=FALSE is more thorough)
+        # We use tryCatch to skip if data is flat/constant
+        fit <- tryCatch(
+            {
+                auto.arima(ts_train, seasonal = TRUE, stepwise = TRUE, approximation = TRUE)
+            },
+            error = function(e) NULL
+        )
+
+        if (is.null(fit)) next
+
+        # FORECAST
+        # We forecast 6 steps ahead (Horizon 1 to 6)
+        fc <- forecast(fit, h = 6, level = c(50, 90, 95))
+
+        # EXTRACT 1, 3, 6 MONTH HORIZONS
+        for (h in c(1, 3, 6)) {
+            # Forecast Mean and SD for this horizon
+            # ARIMA forecast objects provide Mean and usually Upper/Lower bounds.
+            # It is easier to reconstruct quantiles from Mean + SD assuming Normality.
+            # SD = (Upper95 - Mean) / 1.96
+
+            pred_mean <- fc$mean[h]
+            # Recover SD from the 95% interval provided by forecast()
+            # (Upper - Lower) / (2 * 1.96)
+            pred_sd <- (fc$upper[h, "95%"] - fc$lower[h, "95%"]) / 3.92
+
+            # Generate Probabilistic Quantiles
+            q_vals <- qnorm(quantiles, mean = pred_mean, sd = pred_sd)
+
+            # Metadata
+            target_end_date <- cutoff_date %m+% months(h)
+            obs_val <- dt_reg[Date == target_end_date, log_cases]
+            if (length(obs_val) == 0) obs_val <- NA_real_
+
+            # Store
+            dt_res <- data.table(
+                region = reg,
+                forecast_date = cutoff_date,
+                target_end_date = target_end_date,
+                horizon = h,
+                quantile = quantiles,
+                predicted = q_vals,
+                observed = obs_val,
+                model = "AutoARIMA"
+            )
+
+            arima_preds[[paste(reg, cutoff, h, sep = "_")]] <- dt_res
+        }
+    }
+    cat(".") # Progress indicator
+}
+cat("\nFinished.\n")
+
+# Combine results
+dt_arima_results <- rbindlist(arima_preds)
+
+# ==============================================================================
+# 3. EVALUATION (WIS & R2)
+# ==============================================================================
+
+# A. Score with scoringutils
+score_df <- dt_arima_results[!is.na(true_value)]
+score_df <- as_forecast_quantile(score_df, quantile_level = "quantile")
+scores <- score(score_df)
+
+# Summarize WIS (Lower is Better)
+wis_summary <- scores %>%
+    summarise_scores(by = c("region", "horizon")) %>%
+    as.data.table()
+
+# B. Calculate R2 (Higher is Better)
+sarima_r2_summary <- dt_arima_results[quantile == 0.5 & !is.na(true_value),
+    .(R2 = cor(prediction, true_value)^2),
+    by = .(region, horizon)
+]
+ggplot(sarima_r2_summary) +
+    geom_line(aes(x = horizon, y = R2, color = factor(region))) +
+    theme_bw()
+# Combine metrics for visualization
+metrics_combined <- merge(wis_summary[, .(region, horizon, wis)],
+    sarima_r2_summary,
+    by = c("region", "horizon")
+)
+
+# ==============================================================================
+# 4. VISUALISATION OF FORECASTS (Fan Plot)
+# ==============================================================================
+
+# Plot Horizon = 3 for a sample region
+plot_region <- my_regions[1] # Change index to see others
+plot_data_fc <- dt_arima_results[horizon == 3 & region == plot_region]
+
+# Reshape for Ribbon Plot
+plot_wide <- plot_data_fc %>%
+    pivot_wider(names_from = quantile, values_from = prediction, names_prefix = "q_") %>%
+    as.data.table()
+
+g_fc <- ggplot(plot_wide, aes(x = target_end_date)) +
+    geom_ribbon(aes(ymin = q_0.025, ymax = q_0.975), fill = "firebrick", alpha = 0.15) +
+    geom_ribbon(aes(ymin = q_0.25, ymax = q_0.75), fill = "firebrick", alpha = 0.25) +
+    geom_line(aes(y = q_0.5), color = "firebrick", size = 1) +
+    geom_point(aes(y = true_value), size = 1) +
+    labs(
+        title = paste("AutoARIMA Forecast (3-Month Horizon):", plot_region),
+        subtitle = "Red = Forecast (Median + 50/95% PI), Dots = Observed",
+        y = "Log Cases", x = "Date"
+    ) +
+    theme_minimal()
+
+print(g_fc)
+
+# ==============================================================================
+# 5. VISUALISATION OF EVALUATION (WIS & R2)
+# ==============================================================================
+
+# Reshape metrics for faceted plotting
+metrics_long <- melt(metrics_combined,
+    id.vars = c("region", "horizon"),
+    variable.name = "Metric", value.name = "Value"
+)
+colnames(dt_final)
+```
+
+
+
+
+# GAM Fitting
+
+```{r}
+# GAM for 20 regions independently
+my_regions <- unique(dt_plot$Region)[120:140]
+forecast_dates <- unique(dt_plot[which(year(Date) %in% c("2021", "2022"))]$Date)
+
+# Define Quantiles for Probabilistic Forecasting
+# 50% is median, others form the intervals (50%, 90%, 95%)
+quantiles <- c(
+    0.010, 0.025, 0.050, 0.100, 0.150, 0.200, 0.250, 0.300, 0.350,
+    0.400, 0.450, 0.500, 0.550, 0.600, 0.650, 0.700, 0.750, 0.800,
+    0.850, 0.900, 0.950, 0.975, 0.990
+)
+
+# Prepare Data Structure for Direct Forecasting
+# We shift targets GLOBALLY first to ensure efficiency, then subset in loop
+dt_proc <- copy(dt_plot[Region %in% my_regions])
+setorder(dt_proc, Region, Date)
+
+dt_proc[, `:=`(
+    target_1m = shift(log_cases, n = 1, type = "lead"),
+    target_3m = shift(log_cases, n = 3, type = "lead"),
+    target_6m = shift(log_cases, n = 6, type = "lead"),
+    month_num = month(Date)
+), by = Region]
+
+# Container for results
+all_preds <- list()
+
+# ==============================================================================
+# 2. THE ROLLING LOOP
+# ==============================================================================
+
+cat("Starting Rolling Forecasts... this may take a moment.\n")
+
+for (reg in my_regions) {
+    # Subset data for this region ONE time
+    dt_reg <- dt_proc[Region == reg]
+
+    for (cutoff in as.character(forecast_dates)) {
+        cutoff_date <- as.Date(cutoff)
+
+        # --- TRAINING SET DEFINITION ---
+        # We can only train on rows where the Target is KNOWN at the cutoff.
+        # For Horizon h, the Target (y_t+h) is known only if (t+h) <= cutoff.
+        # In Direct Forecasting structure: Row t contains Target t+h.
+        # So we train on rows where Date + h <= cutoff_date.
+
+        # Prediction Input: The row AT the cutoff date (contains current predictors)
+        newdata <- dt_reg[Date == cutoff_date]
+
+        # If we don't have predictors for the cutoff (e.g., end of series), skip
+        if (nrow(newdata) == 0) next
+
+        # --- FIT & PREDICT PER HORIZON ---
+
+        for (h in c(1, 3, 6)) {
+            target_col <- paste0("target_", h, "m")
+
+            # Correct Training Filter:
+            # We need rows where the TARGET outcome actually happened before or on cutoff.
+            # Since 'target_col' is a future value relative to 'Date',
+            # we filter: Date <= (cutoff_date - months(h))
+            train_limit <- cutoff_date %m-% months(h)
+            train_data <- dt_reg[Date <= train_limit & !is.na(get(target_col))]
+
+            # Skip if not enough training data
+            if (nrow(train_data) < 24) next
+
+            # FIT GAM (Restricted k to prevent explosion on sparse updates)
+            # Using tryCatch to handle convergence failures gracefully
+            fit <- tryCatch(
+                {
+                    gam(as.formula(paste(target_col, "~ s(log_cases, k=5) +
+                             s(reanalysis_t2m, k=5) +
+                             s(reanalysis_rh, k=5) +
+                             s(reanalysis_tp, k=5) +
+                             s(month_num, bs='cc', k=12)")),
+                        data = train_data, select = TRUE,
+                        method = "REML", family = gaussian()
+                    )
+                },
+                error = function(e) NULL
+            )
+
+            if (is.null(fit)) next
+
+            # PREDICT (Mean and Standard Error)
+            p <- predict(fit, newdata = newdata, type = "response", se.fit = TRUE)
+
+            # GENERATE PROBABILISTIC QUANTILES (Gaussian Assumption)
+            # Q = Mean + Z_score * SE
+            q_vals <- qnorm(quantiles, mean = p$fit, sd = p$se.fit)
+
+            # STORE RESULTS
+            # Format specifically for scoringutils: true_value, prediction, quantile...
+
+            # Calculate the actual date we are predicting for
+            target_end_date <- cutoff_date %m+% months(h)
+
+            # Find True Value for evaluation (if it exists in data)
+            obs_val <- dt_reg[Date == target_end_date, log_cases]
+            if (length(obs_val) == 0) obs_val <- NA_real_
+
+            dt_res <- data.table(
+                region = reg,
+                forecast_date = cutoff_date, # Date prediction was made
+                target_end_date = target_end_date, # Date being predicted
+                horizon = h,
+                quantile_level = quantiles,
+                predicted = q_vals,
+                observed = obs_val,
+                model = "GAM_Direct"
+            )
+
+            all_preds[[paste(reg, cutoff, h, sep = "_")]] <- dt_res
+        }
+    }
+    cat("Finished Region:", reg, "\n")
+}
+
+# Combine all results
+dt_results <- rbindlist(all_preds)
+
+# ==============================================================================
+# 3. SCORING (WIS & R2)
+# ==============================================================================
+
+# Clean up for scoringutils
+score_df <- dt_results[!is.na(observed)] # Can only score if we observed the truth
+score_df <- as_forecast_quantile(score_df)
+
+# A. Calculate WIS using scoringutils
+scores <- score(score_df)
+# Summarize WIS by Horizon and Region
+wis_summary <- scores %>%
+    summarise_scores(by = c("region", "horizon"))
+
+print(head(wis_summary))
+
+# B. Calculate R-squared (on the Median forecast)
+r2_summary <- dt_results[quantile_level == 0.5 & !is.na(observed),
+    .(R2 = cor(predicted, observed)^2),
+    by = .(region, horizon)
+]
+
+print(head(r2_summary))
+ggplot(r2_summary) +
+    geom_line(aes(x = horizon, y = R2, color = factor(region))) +
+    theme_bw()
+head(dt_results)
+
+
+# ==============================================================================
+# 4. VISUALIZATION
+# ==============================================================================
+
+# We visualize one specific horizon (e.g., 3-month ahead) for clarity,
+# or loop to produce 3 plots. Here is the 3-month plot.
+
+plot_horizon <- 3
+plot_data <- dt_results[horizon == plot_horizon]
+head(plot_data)
+# We need to reshape slightly for a "Fan Plot" or Ribbon Plot
+# Pivot wider to get columns for specific quantiles for geom_ribbon
+library(tidyr)
+plot_wide <- plot_data %>%
+    select(region, target_end_date, quantile_level, predicted, observed) %>%
+    pivot_wider(names_from = quantile_level, values_from = predicted, names_prefix = "q_") %>%
+    as.data.table()
+
+# Plotting top 4 regions for visual clarity (adjust as needed)
+plot_regions <- my_regions[1:4]
+
+g <- ggplot(plot_wide[region %in% plot_regions], aes(x = target_end_date)) +
+    # 95% Interval
+    geom_ribbon(aes(ymin = q_0.025, ymax = q_0.975), fill = "blue", alpha = 0.1) +
+    # 50% Interval
+    geom_ribbon(aes(ymin = q_0.25, ymax = q_0.75), fill = "blue", alpha = 0.2) +
+    # Median Line
+    geom_line(aes(y = q_0.5), color = "blue") +
+    # True Data Points
+    geom_point(aes(y = observed), color = "black", size = 1) +
+    facet_wrap(~region, scales = "free_y") +
+    labs(
+        title = paste("Rolling Origin Forecast:", plot_horizon, "Months Ahead"),
+        subtitle = "Blue Line = Median, Shading = 50% & 95% PIs",
+        y = "Log Cases", x = "Date"
+    ) +
+    theme_minimal()
+
+print(g)
+```
+
+
+
+```{r, fig.show="asis"}
+agg_plot_for_printing
+```
+
+```{r, fig.show="asis"}
+## ---------------------------
+## Rolling-origin SARIMA + GAM forecasting (20 regions)
+## - Uses dt_final as input (data.table)
+## - Forecasts at 1,3,6 month horizons (rows assumed monthly)
+## - Models & eval on log(cases+1)
+## - Produces quantile forecasts (0.05,0.1,0.5,0.9,0.95)
+## - Evaluates with scoringutils (latest workflow) and R2 for median
+## - Capture performance across space + time, and across models + horizons
+## ---------------------------
+
+# standardize names to simpler lower-case variable names in this script
+dt <- copy(dt_final)
+setnames(dt, old = "Region", new = "region")
+setnames(dt, old = "Date", new = "date")
+setnames(dt, old = "Cases", new = "cases")
+# ensure date is Date
+dt[, date := as.IDate(date)]
+setorder(dt, region, date)
+
+# ---------- settings (tweak for speed / accuracy) ----------
+target_quantiles <- c(0.05, 0.1, 0.5, 0.9, 0.95)
+horizons <- c(1L, 3L, 6L) # months (assumes regular monthly rows)
+n_boot <- 1000 # predictive draws per forecast (reduce to 200 for quick debug)
+n_regions <- 20 # run on 20 regions as requested
+eval_start <- as.IDate("2021-01-01")
+eval_end <- as.IDate("2022-12-31")
+warmup_months <- 24L # require at least this many months for first origin
+seed <- 42
+set.seed(seed)
+
+# ---------- helper: log-transform target (fit on log1p) ----------
+dt[, logy := log1p(cases)]
+
+# ---------- identify 20 regions with most data (defensive) ----------
+region_counts <- dt[, .N, by = region][order(-N)]
+chosen_regions <- head(region_counts$region, n_regions)
+message("Chosen regions (", length(chosen_regions), "): ", paste(chosen_regions, collapse = ", "))
+
+# ---------- create time index per region (strict monthly assumption) ----------
+# We'll create a per-region index to shift by horizons (assumes regular monthly spacing)
+dt[, ym := as.yearmon(date)]
+dt[, t_idx := seq_len(.N), by = region] # index by row for each region (1,2,3,...)
+
+# ---------- convenience: make dt keyed for fast lookups ----------
+setkey(dt, region, t_idx)
+
+# ---------- predictor set for GAM (choose sensible numeric covariates from dt) ----------
+# We will use a compact numeric covariate set (non-factor) and allow mgcv select=TRUE to drop them if unhelpful
+possible_covs <- c(
+    "pop_count", "pop_density", "gdp_gdp_pc", "reanalysis_t2m", "reanalysis_rh", "reanalysis_tp",
+    paste0("seas_t2m_L", 1:6), paste0("seas_rh_L", 1:6), paste0("seas_tp_L", 1:6)
+)
+# keep only those present
+covariates <- intersect(possible_covs, names(dt))
+message("GAM covariates used: ", paste(covariates, collapse = ", "))
+
+# ---------- helper functions ----------
+# 1) Build training frame for a region at origin index i (t_idx = i means training up to and including i)
+build_train_frame <- function(region_name, origin_ti) {
+    df <- dt[J(region_name, 1:origin_ti), nomatch = 0]
+    return(copy(df))
+}
+# 2) Build newdata for target t_idx = j (row j)
+build_newdata <- function(region_name, target_ti) {
+    row <- dt[J(region_name, target_ti), nomatch = 0]
+    if (nrow(row) == 0) {
+        return(NULL)
+    }
+    return(as.data.frame(row[, c("t_idx", covariates), with = FALSE]))
+}
+# 3) ARIMA predictive draws: fit auto.arima on logy training series and simulate nsim paths ahead then take last value
+arima_draws <- function(train_y, h, nsim) {
+    # train_y: numeric vector (logy)
+    if (length(na.omit(train_y)) < 12) {
+        return(rep(NA_real_, nsim))
+    } # too short
+    fit <- tryCatch(auto.arima(train_y, seasonal = TRUE, stepwise = FALSE, approximation = FALSE, lambda = NULL, biasadj = FALSE),
+        error = function(e) NULL
+    )
+    if (is.null(fit)) {
+        return(rep(NA_real_, nsim))
+    }
+    # simulate nsim future paths of length h and take the h-th value
+    sims <- tryCatch(
+        {
+            replicate(nsim, {
+                sim <- simulate(fit, nsim = h, future = TRUE)
+                as.numeric(sim[h])
+            })
+        },
+        error = function(e) {
+            # fallback: use forecast mean +/- normal draws
+            f <- forecast(fit, h = h, bootstrap = FALSE)
+            mu <- as.numeric(f$mean[h])
+            sigma <- sqrt(mean(f$residuals^2, na.rm = TRUE))
+            rnorm(nsim, mean = mu, sd = sigma)
+        }
+    )
+    return(as.numeric(sims))
+}
+# 4) GAM predictive draws: predict mean then add Gaussian noise with sigma estimated from training residuals
+gam_draws <- function(gam_fit, newdata, nsim, train_resid_sd) {
+    mu <- tryCatch(predict(gam_fit, newdata = newdata, type = "response"), error = function(e) NA_real_)
+    if (is.na(mu)) {
+        return(rep(NA_real_, nsim))
+    }
+    sigma <- ifelse(is.na(train_resid_sd) || train_resid_sd <= 0, 1e-6, train_resid_sd)
+    rnorm(nsim, mean = as.numeric(mu), sd = sigma)
+}
+
+# ---------- Main rolling-origin loop for chosen regions ----------
+# We'll collect per-forecast samples and then convert to quantiles
+res_list <- list()
+counter <- 0L
+for (region_name in chosen_regions) {
+    message("Region: ", region_name)
+    # subset times for this region
+    times <- dt[region == region_name, t_idx]
+    n_time <- length(times)
+    # require at least warmup_months + max(horizons)
+    if (n_time < (warmup_months + max(horizons))) {
+        message("  skipping region ", region_name, " (not enough time points: ", n_time, ")")
+        next
+    }
+    # origin indices: origins i where some i + h has target date in eval window
+    # compute mapping from t_idx to date for this region
+    tdate <- dt[region == region_name, .(t_idx, date)]
+    for (origin_i in seq(warmup_months, n_time - min(horizons))) {
+        # check if any forecast targets for this origin fall into eval window
+        target_indices <- origin_i + horizons
+        valid_targets <- target_indices[target_indices <= n_time & (tdate$t_idx %in% target_indices) & (tdate[match(target_indices, tdate$t_idx), date] >= eval_start) & (tdate[match(target_indices, tdate$t_idx), date] <= eval_end)]
+        if (length(valid_targets) == 0) next
+
+        # Build training data (no leakage)
+        train_df <- build_train_frame(region_name, origin_i)
+        train_y <- train_df$logy
+
+        # 1) Fit ARIMA on training logy
+        # defensive: only if length sufficient
+        arima_ok <- length(na.omit(train_y)) >= 12
+        # 2) Fit GAM on training data pooled for region only (we fit per-region GAM); to improve stability we use select=TRUE
+        # Use formula: logy ~ s(t_idx, k=20) + s(t_idx, by=1?) + linear covariates; include select=TRUE to allow shrinkage
+        # We'll include covariates if present; fill NAs in covariates with column mean of training set
+        if (length(covariates) > 0) {
+            for (cv in covariates) {
+                if (!(cv %in% names(train_df))) next
+                if (any(is.na(train_df[[cv]]))) train_df[[cv]][is.na(train_df[[cv]])] <- mean(train_df[[cv]], na.rm = TRUE)
+            }
+        }
+        # formula construction
+        covpart <- if (length(covariates) > 0) paste(covariates, collapse = " + ") else ""
+        fmla_text <- paste0("logy ~ s(t_idx, k = 20) ", if (covpart != "") paste0(" + ", covpart) else "")
+        fmla <- as.formula(fmla_text)
+        gam_fit <- tryCatch(bam(fmla, data = train_df, method = "REML", select = TRUE, discrete = TRUE), error = function(e) {
+            message("   GAM fit failed at origin ", origin_i, " for region ", region_name, ": ", e$message)
+            return(NULL)
+        })
+        # compute train residual sd for GAM
+        gam_resid_sd <- if (!is.null(gam_fit)) sqrt(summary(gam_fit)$scale) else NA_real_
+
+        # For each valid horizon, produce predictive draws for both models
+        for (h in horizons) {
+            j <- origin_i + h
+            if (j > n_time) next
+            target_date <- dt[region == region_name & t_idx == j, date][1]
+            if (is.na(target_date) || target_date < eval_start || target_date > eval_end) next
+
+            # newdata row for GAM
+            newdata <- build_newdata(region_name, j)
+            if (!is.null(newdata) && length(covariates) > 0) {
+                # ensure covariates exist and fill with training means if NA
+                for (cv in covariates) {
+                    if (!(cv %in% names(newdata))) newdata[[cv]] <- mean(train_df[[cv]], na.rm = TRUE)
+                    if (is.na(newdata[[cv]])) newdata[[cv]] <- mean(train_df[[cv]], na.rm = TRUE)
+                }
+            }
+
+            # ARIMA draws
+            arima_samples <- if (arima_ok) arima_draws(train_y, h = h, nsim = n_boot) else rep(NA_real_, n_boot)
+            # GAM draws
+            gam_samples <- if (!is.null(gam_fit)) gam_draws(gam_fit, newdata, nsim = n_boot, train_resid_sd = gam_resid_sd) else rep(NA_real_, n_boot)
+
+            # For both models compute quantiles and store
+            models <- list(SARIMA = arima_samples, GAM = gam_samples)
+            for (modname in names(models)) {
+                samp <- models[[modname]]
+                # remove NA-only samples
+                if (all(is.na(samp))) {
+                    qvals <- rep(NA_real_, length(target_quantiles))
+                } else {
+                    qvals <- as.numeric(quantile(samp, probs = target_quantiles, na.rm = TRUE, names = FALSE, type = 8))
+                }
+                out <- data.table(
+                    region = region_name,
+                    model = modname,
+                    origin_t_idx = origin_i,
+                    origin_date = dt[region == region_name & t_idx == origin_i, date][1],
+                    target_date = target_date,
+                    horizon = h,
+                    actual_log = dt[region == region_name & t_idx == j, logy][1]
+                )
+                for (kq in seq_along(target_quantiles)) out[[paste0("q", target_quantiles[kq])]] <- qvals[kq]
+                res_list[[length(res_list) + 1L]] <- out
+            } # models
+            counter <- counter + 1L
+            if (counter %% 100 == 0) message("  forecasts produced: ", counter)
+        } # horizons loop
+    } # origin loop
+} # region loop
+
+# combine into data.table
+fcst_dt <- rbindlist(res_list, fill = TRUE)
+if (nrow(fcst_dt) == 0) stop("No forecasts generated - check settings or data coverage.")
+
+# ---------- Convert to scoringutils format and score ----------
+# scoringutils expects quantile-long format: one row per quantile per forecast unit
+qcols <- paste0("q", target_quantiles)
+long <- melt(fcst_dt,
+    id.vars = c("region", "model", "origin_date", "target_date", "horizon", "actual_log"),
+    measure.vars = qcols, variable.name = "quantile_col", value.name = "prediction"
+)
+long[, quantile := as.numeric(sub("^q", "", quantile_col))]
+# rename fields to scoringutils expectations
+long[, `:=`(location = region, forecast_date = origin_date, target_end_date = target_date, observed = actual_log, target_type = "log_cases")]
+# keep only relevant cols
+scoring_input <- long[, .(location, forecast_date, target_end_date, target_type, model, horizon, quantile, prediction, observed)]
+
+# Use as_forecast_quantile() to validate / create forecast object (per scoringutils workflow)
+forecast_obj <- as_forecast_quantile(scoring_input,
+    forecast_unit = c("location", "forecast_date", "target_end_date", "target_type", "model", "horizon"),
+    observed = "observed",
+    predicted = "prediction",
+    quantile_level = "quantile"
+)
+# Score and summarise
+scores_raw <- score(forecast_obj) # uses default quantile-based metrics including wis
+summary_by_model_region_h <- summarise_scores(scores_raw, by = c("model", "location", "horizon"))
+
+# find WIS column name robustly (scoringutils column names may vary)
+wis_col <- grep("^wis$|weighted.*interval|interval.*score", names(summary_by_model_region_h), ignore.case = TRUE, value = TRUE)[1]
+if (is.na(wis_col)) stop("WIS column not found in summarised scores; inspect names(summary_by_model_region_h).")
+eval_scores <- summary_by_model_region_h[, .(model, region = location, horizon, mean_wis = get(wis_col), n_forecasts = if ("n_forecasts" %in% names(summary_by_model_region_h)) n_forecasts else NA_integer_)]
+
+# compute R^2 for median per region/model/horizon (on log scale)
+# extract median predictions from fcst_dt
+if (!("q0.5" %in% names(fcst_dt))) stop("Median (q0.5) missing in fcst_dt")
+r2_dt <- fcst_dt[, .(region, model, horizon, pred_med = q0.5, actual = actual_log)]
+r2_summary <- r2_dt[, .(
+    r2_median = {
+
+    }
+), by = .(region, model, horizon)]
+r2_summary <- data.table(r2_dt)[, list(r2_median = caret::R2(actual, pred_med)), by = .(region, model, horizon)]
+head(r2_summary)
+# merge evals
+eval_full <- merge(eval_scores, r2_summary, by = c("region", "model", "horizon"), all.x = TRUE)
+
+
+# ---------- Rolling 3-month evaluation windows ----------
+# We'll define consecutive three-month windows on calendar date and summarise WIS per window
+# Create windows: sequence of months within eval_start..eval_end stepping by 1 month; each window is [m, m+2 months]
+library(zoo)
+months_seq <- seq(from = as.yearmon(eval_start), to = as.yearmon(eval_end), by = 1 / 12)
+window_list <- lapply(seq_along(months_seq), function(i) {
+    start <- months_seq[i]
+    end <- start + 2 / 12
+    list(start = as.Date(start), end = as.Date(end + 1 / 12 - 1)) # end of month approx - inclusive
+})
+# convert scores_raw to data.table summarised per forecast unit (it contains forecast_id-level metrics)
+scores_dt <- as.data.table(scores_raw) # scores_raw is the scoringutils object; as.data.table extracts rows
+# The scores table contains columns: location, forecast_date, target_end_date, model, horizon, wis, etc.
+# We'll map each forecast's target_end_date to the window it belongs to (if any) and summarise mean WIS
+scores_dt[, target_date := as.IDate(target_end_date)]
+# create window id function
+assign_window <- function(td) {
+    for (w in seq_along(window_list)) {
+        if (td >= window_list[[w]]$start && td <= window_list[[w]]$end) {
+            return(w)
+        }
+    }
+    return(NA_integer_)
+}
+scores_dt[, win := sapply(target_date, assign_window)]
+# keep only those with non-NA win
+winsummary <- scores_dt[!is.na(win), .(mean_wis = mean(wis, na.rm = TRUE), n = .N), by = .(model, location, horizon, win)]
+# add window start/end for readability
+winsummary[, `:=`(
+    window_start = sapply(win, function(w) window_list[[w]]$start),
+    window_end = sapply(win, function(w) window_list[[w]]$end)
+)]
+setorder(winsummary, model, location, horizon, window_start)
+
+# ---------- Output: print summaries and sample plots ----------
+message("Evaluation summary (first rows):")
+print(head(eval_full, 20))
+message("Rolling 3-month window summary (sample):")
+print(head(winsummary, 20))
+
+# Example visualization: compare mean WIS across models aggregated across regions by horizon
+agg_plot <- eval_full[, .(mean_wis = mean(mean_wis, na.rm = TRUE)), by = .(model, horizon)]
+agg_plot_for_printing <- ggplot(agg_plot, aes(x = factor(horizon), y = mean_wis, fill = model)) +
+    geom_col(position = position_dodge()) +
+    labs(x = "Horizon (months)", y = "Mean WIS (log1p scale)", title = "Average WIS by model and horizon")
+print(agg_plot_for_printing)
+
+# Example spatio-temporal: mean WIS per region for horizon=1
+region_plot <- eval_full[horizon == 1, .(mean_wis = mean(mean_wis, na.rm = TRUE)), by = .(region, model)]
+ggplot(region_plot, aes(x = model, y = mean_wis)) +
+    geom_boxplot() +
+    labs(title = "Distribution of WIS across regions (horizon=1)")
+
+# Save results object for user inspection
+res <- list(forecasts = fcst_dt, scores_raw = scores_raw, eval_summary = eval_full, window_summary = winsummary)
+# saveRDS(res, "sarima_gam_rolling_forecasts_eval.rds")
+
+message("Done. res contains forecasts, raw scores, eval summary and window summary.")
+```
+
+
+
+```{r}
+# More evaluation for the above: Can be adapted very easily
+# 2) Aggregate / summarise scores at different granularities
+# By model + horizon (use mean as primary summary)
+summary_model_horizon <- summarise_scores(scores_raw, by = c("model", "horizon"))
+summary_model_region_h <- summarise_scores(scores_raw, by = c("model", "location", "horizon"))
+summary_model_overall <- summarise_scores(scores_raw, by = c("model"))
+
+# show top-level summary
+print("Summary by model and horizon:")
+print(summary_model_horizon)
+
+# 3) Extract specific useful metrics (WIS, bias, dispersion, interval coverage, ae_median)
+# scoringutils standard names: 'wis', 'bias', 'dispersion', 'interval_coverage_50', 'interval_coverage_90', 'ae_median'
+# but names can vary by version; check available names and use them
+print("Available metric columns in summary (sample):")
+print(names(summary_model_horizon))
+
+# 4) Interval coverage (quantile-based): compute and plot
+# get_coverage() produces coverage results (quantile & interval) grouped by the 'by' argument
+coverage_by_model <- get_coverage(forecast_obj, by = "model")
+
+
+
+# 6) PIT / calibration histogram (works for sample forecasts; scoringutils provides tools)
+# If you have sample forecasts, compute PIT histogram:
+# For quantile forecasts scoringutils approximates PIT via quantile rank; but if you have sample forecasts use get_pit_histogram()
+if ("sample" %in% class(forecast_obj)) {
+    pit <- get_pit_histogram(forecast_obj, by = "model")
+} else {
+    # approximate PIT from quantiles via scores (scoringutils has helpers)
+    pit_approx <- get_pit_histogram(forecast_obj, by = "model")
+}
+
+# 7) WIS decomposition plot (contribution: interval width, over/under-prediction)
+# plot_wis expects a scores-object (with WIS breakdown available)
+p_wis <- plot_wis(summary_model_overall, x = "model")
+print(p_wis)
+
+p_wis_decomposition <- plot_wis(summary_model_horizon, x = "model")
+print(p_wis_decomposition)
+
+p_wis_decomposition_by_horizon <- plot_wis(summary_model_horizon, x = "model") + facet_wrap(horizon ~ .)
+print(p_wis_decomposition_by_horizon)
+
+# metric heatmap across space/time: use summarise_scores then plot_heatmap
+# choose a metric name from summary_model_region_h, for example 'wis' or 'ae_median'
+metric_to_plot <- NULL
+cand <- c("wis", "ae_median", "bias", "dispersion")
+metric_to_plot <- intersect(cand, names(summary_model_region_h))[1]
+if (!is.null(metric_to_plot)) {
+    p_heat <- plot_heatmap(summary_model_region_h, metric = metric_to_plot, x = "horizon", y = "location")
+    print(p_heat)
+} else {
+    message("Metric (wis/ae_median/bias/dispersion) not found in summarised table - inspect names(summary_model_region_h).")
+}
+
+# 9) Pairwise model comparisons (relative skill)
+pairwise <- get_pairwise_comparisons(scores_raw, by = c("location", "horizon"))
+p_pairwise <- plot_pairwise_comparisons(pairwise, type = "mean_scores_ratio")
+print(p_pairwise)
+
+# 11) Rolling / sliding 3-month window evaluation
+# We create calendar windows and compute mean WIS per model / horizon in each window
+library(zoo)
+# window starts: monthly from eval_start to eval_end
+eval_start <- min(as.IDate(forecast_obj$target_end_date), na.rm = TRUE)
+eval_end <- max(as.IDate(forecast_obj$target_end_date), na.rm = TRUE)
+months_seq <- seq(as.yearmon(eval_start), as.yearmon(eval_end), by = 1 / 12)
+windows <- lapply(seq_along(months_seq), function(i) {
+    start <- as.Date(months_seq[i])
+    end <- as.Date(months_seq[i] + 2 / 12) + months(1) - days(1) # inclusive 3-month window
+    list(start = start, end = end)
+})
+# helper: assign forecasts to windows by target_end_date
+scores_dt <- as.data.table(scores_raw)
+scores_dt[, target_date := as.IDate(target_end_date)]
+assign_win <- function(td) {
+    for (w in seq_along(windows)) {
+        if (!is.na(td) && td >= windows[[w]]$start && td <= windows[[w]]$end) {
+            return(w)
+        }
+    }
+    return(NA_integer_)
+}
+scores_dt[, win := vapply(target_date, assign_win, integer(1))]
+# summarise by model, horizon, window
+win_summary <- scores_dt[!is.na(win), .(
+    mean_wis = mean(wis, na.rm = TRUE),
+    median_wis = median(wis, na.rm = TRUE),
+    n = .N
+), by = .(model, horizon, win)]
+# attach window start/end for readability
+win_summary[, `:=`(
+    window_start = sapply(win, function(w) windows[[w]]$start),
+    window_end = sapply(win, function(w) windows[[w]]$end)
+)]
+setorder(win_summary, model, horizon, window_start)
+print(head(win_summary, 20))
+
+# 12) Save diagnostic plots and tables
+# ggsave("coverage_by_model.png", p_cov, width=8, height=5)
+# ggsave("wis_contribution.png", p_wis, width=8, height=5)
+# fwrite(win_summary, "rolling_window_wis_by_model_horizon.csv")
+
+# 13) If you have sample forecasts (forecast_obj_sample), compute CRPS using scoringutils::crps_sample
+# Example (uncomment if you have sample forecasts):
+# crps_dt <- summarise_scores(score(as_forecast_sample(forecast_obj_sample)), by = c("model","horizon"))
+# print(crps_dt)
+
+# -------------------------
+# Final: return main objects
+# -------------------------
+eval_results <- list(
+    scores = scores_raw,
+    summary_model_horizon = summary_model_horizon,
+    summary_model_region_h = summary_model_region_h,
+    coverage_by_model = coverage_by_model,
+    pit = pit_approx,
+    win_summary = win_summary,
+    pairwise = pairwise
+)
+```
